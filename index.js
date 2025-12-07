@@ -6,117 +6,9 @@ const app = express();
 app.use(express.json());
 
 /**
- * Config
+ * Configuración
  */
 const DEFAULT_PAGE_SIZE = 20;
-
-// Usa el id de tu proyecto (o lo toma de las credenciales)
-const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || "commanding-time-480517-k5";
-const LOCATION = "us-central1";
-const MODEL_ID = "gemini-1.5-flash-002";
-
-/**
- * Inicializar Vertex AI (Gemini)
- */
-let generativeModel;
-try {
-  const vertexAI = new VertexAI({ project: PROJECT_ID, location: LOCATION });
-  generativeModel = vertexAI.getGenerativeModel({ model: MODEL_ID });
-  console.log("Vertex AI listo con modelo:", MODEL_ID);
-} catch (err) {
-  console.error("Error inicializando Vertex AI:", err);
-}
-
-/**
- * Utilidades
- */
-function escapeForDrive(value = "") {
-  return String(value).replace(/'/g, "\\'");
-}
-
-/**
- * Llamar a Vertex AI para entender la frase y extraer keywords
- */
-async function extraerKeywordsConLLM(userQuery) {
-  if (!generativeModel) {
-    console.warn("Vertex AI no inicializado, usando fallback.");
-    const fallbackKeywords = userQuery
-      .toLowerCase()
-      .split(/\s+/)
-      .filter((w) => w.length > 3);
-    return {
-      search_phrase: userQuery,
-      keywords: fallbackKeywords,
-    };
-  }
-
-  const prompt = `
-Eres un asistente que ayuda a buscar documentos en una biblioteca académica en Google Drive.
-
-Usuario dice:
-"${userQuery}"
-
-Tu tarea:
-1. Entender qué documento está buscando (libro, guía, apunte, paper, diapositivas, etc.).
-2. Extraer entre 2 y 5 palabras clave importantes (keywords).
-3. Proponer una frase corta de búsqueda (search_phrase) para usarla como texto principal.
-
-Responde ÚNICAMENTE en JSON con esta forma exacta:
-
-{
-  "search_phrase": "frase corta de búsqueda",
-  "keywords": ["palabra1", "palabra2", "palabra3"]
-}
-`;
-
-  const response = await generativeModel.generateContent({
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-  });
-
-  const part = response?.response?.candidates?.[0]?.content?.parts?.[0];
-  const text = (part?.text || "").trim();
-
-  try {
-    const parsed = JSON.parse(text);
-    if (
-      parsed &&
-      typeof parsed.search_phrase === "string" &&
-      Array.isArray(parsed.keywords)
-    ) {
-      return parsed;
-    }
-  } catch (e) {
-    console.error("No pude parsear JSON del LLM, texto recibido:", text);
-  }
-
-  const fallbackKeywords = userQuery
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((w) => w.length > 3);
-
-  return {
-    search_phrase: userQuery,
-    keywords: fallbackKeywords,
-  };
-}
-
-/**
- * Construir la query de Drive a partir de keywords
- */
-function buildContentQueryFromKeywords(keywords, fallbackPhrase) {
-  const filters = ["trashed = false"];
-
-  if (Array.isArray(keywords) && keywords.length > 0) {
-    const contentFilters = keywords.map(
-      (w) => `fullText contains '${escapeForDrive(w)}'`
-    );
-    filters.push(`(${contentFilters.join(" and ")})`);
-  } else if (fallbackPhrase) {
-    filters.push(`fullText contains '${escapeForDrive(fallbackPhrase)}'`);
-  }
-
-  return filters.join(" and ");
-}
 
 /**
  * Cliente de Drive
@@ -125,6 +17,114 @@ const auth = new google.auth.GoogleAuth({
   scopes: ["https://www.googleapis.com/auth/drive.readonly"],
 });
 const drive = google.drive({ version: "v3", auth });
+
+/**
+ * Inicializar Vertex AI
+ */
+let generativeModel = null;
+
+try {
+  const vertexAI = new VertexAI({
+    project: process.env.GOOGLE_CLOUD_PROJECT,
+    location: "us-central1",
+  });
+
+  generativeModel = vertexAI.getGenerativeModel({
+    model: "google/model-garden/gemini-1.5-flash-002",
+  });
+
+  console.log("VertexAI inicializado correctamente");
+} catch (err) {
+  console.error("NO SE PUDO INICIALIZAR VERTEX AI:", err.message);
+}
+
+/**
+ * Si el modelo falla, hacemos fallback
+ */
+function fallbackKeywords(text) {
+  return text
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length > 4);
+}
+
+/**
+ * Extraer keywords usando Vertex AI
+ */
+async function extraerKeywordsConLLM(userQuery) {
+  const fallback = {
+    search_phrase: userQuery,
+    keywords: fallbackKeywords(userQuery),
+  };
+
+  if (!generativeModel) {
+    console.warn("VertexAI no inicializado → usando Fallback");
+    return fallback;
+  }
+
+  const prompt = `
+Eres un asistente que ayuda a buscar documentos académicos en Google Drive.
+
+Usuario:
+"${userQuery}"
+
+Extrae:
+- Una frase corta para buscar (search_phrase)
+- Entre 2 y 6 palabras clave importantes (keywords)
+
+Responde SOLO en JSON:
+{
+  "search_phrase": "...",
+  "keywords": ["...", "..."]
+}
+`;
+
+  try {
+    const result = await generativeModel.generateContent({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+    });
+
+    const part = result?.response?.candidates?.[0]?.content?.parts?.[0];
+    const raw = (part?.text || "").trim();
+
+    let parsed = null;
+
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      console.warn("JSON inválido del LLM → Fallback:", raw);
+      return fallback;
+    }
+
+    if (
+      parsed &&
+      parsed.search_phrase &&
+      Array.isArray(parsed.keywords) &&
+      parsed.keywords.length > 0
+    ) {
+      return parsed;
+    }
+
+    return fallback;
+  } catch (err) {
+    console.error("Error en Vertex AI:", err.message);
+    return fallback;
+  }
+}
+
+/**
+ * Construir Query de Drive
+ */
+function buildDriveQueryFromKeywords(keywords) {
+  const filters = ["trashed = false"];
+
+  if (keywords.length > 0) {
+    const parts = keywords.map((k) => `fullText contains '${k}'`);
+    filters.push("(" + parts.join(" and ") + ")");
+  }
+
+  return filters.join(" and ");
+}
 
 /**
  * Handler principal
@@ -140,18 +140,19 @@ app.post("/", async (req, res) => {
       });
     }
 
-    if (query.length > 500) {
-      return res.status(400).json({
-        ok: false,
-        error: "La consulta es demasiado larga",
-      });
-    }
+    console.log("Query recibida:", query);
 
-    const llmResult = await extraerKeywordsConLLM(query);
-    const { search_phrase, keywords } = llmResult;
+    // Paso 1: Interpretar lenguaje natural con LLM
+    const llm = await extraerKeywordsConLLM(query);
 
-    const driveQuery = buildContentQueryFromKeywords(keywords, search_phrase);
+    console.log("Interpretación LLM:", llm);
 
+    // Paso 2: Construir query para Drive
+    const driveQuery = buildDriveQueryFromKeywords(llm.keywords);
+
+    console.log("Drive query:", driveQuery);
+
+    // Paso 3: Buscar en Google Drive
     const response = await drive.files.list({
       q: driveQuery,
       fields: "files(id, name, mimeType, webViewLink, modifiedTime)",
@@ -163,25 +164,24 @@ app.post("/", async (req, res) => {
       total: response.data.files.length,
       archivos: response.data.files,
       understanding: {
-        original_query: query,
-        search_phrase,
-        keywords,
+        original: query,
+        llm,
         drive_query: driveQuery,
       },
     });
   } catch (e) {
-    console.error("Error en /buscar:", e);
+    console.error("Error general:", e);
     return res.status(500).json({
       ok: false,
-      error: e.message || "Error interno en el buscador",
+      error: "Error interno en el buscador",
     });
   }
 });
 
 /**
- * Inicio del servidor
+ * Iniciar servidor
  */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`Servicio buscarendrive escuchando en el puerto ${PORT}`);
+  console.log(`Servicio buscarendrive activo en puerto ${PORT}`);
 });

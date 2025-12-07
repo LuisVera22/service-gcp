@@ -14,7 +14,7 @@ const MAX_PAGE_SIZE = 50;
 // Ajusta si tu proyecto/región son distintos
 const PROJECT_ID = "commanding-time-480517-k5";
 const LOCATION = "us-central1";
-const MODEL_ID = "gemini-1.5-flash";
+const MODEL_ID = "google/model-garden/gemini-1.5-flash-002";
 
 /**
  * Inicializar Vertex AI (Gemini)

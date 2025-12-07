@@ -161,7 +161,9 @@ app.post("/", async (req, res) => {
     console.error("Error en /buscar:", e);
     return res.status(500).json({
       ok: false,
-      error: "Error interno en el buscador",
+      error: e.message || "Error interno en el buscador",
+      // SOLO para depuración, luego lo puedes borrar:
+      details: e.stack || String(e),
     });
   }
 });

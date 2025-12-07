@@ -9,18 +9,29 @@ app.use(express.json());
  * Config
  */
 const DEFAULT_PAGE_SIZE = 20;
-const MAX_PAGE_SIZE = 50;
 
-// Ajusta si tu proyecto/región son distintos
-const PROJECT_ID = "commanding-time-480517-k5";
+/**
+ * Usa el id de tu proyecto, o toma el de las credenciales
+ */
+const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || "commanding-time-480517-k5";
 const LOCATION = "us-central1";
-const MODEL_ID = "google/model-garden/gemini-1.5-flash-002";
+
+/** 
+ * MUY IMPORTANTE: este id es el que viste en Model Garden (versión 002)
+ */
+const MODEL_ID = "gemini-1.5-flash-002";
 
 /**
  * Inicializar Vertex AI (Gemini)
  */
-const vertexAI = new VertexAI({ project: PROJECT_ID, location: LOCATION });
-const generativeModel = vertexAI.getGenerativeModel({ model: MODEL_ID });
+let generativeModel;
+try {
+  const vertexAI = new VertexAI({ project: PROJECT_ID, location: LOCATION });
+  generativeModel = vertexAI.getGenerativeModel({ model: MODEL_ID });
+  console.log("Cliente de Vertex AI inicializado con modelo:", MODEL_ID);
+} catch (err) {
+  console.error("Error inicializando Vertex AI:", err);
+}
 
 /**
  * Utilidades
@@ -33,6 +44,19 @@ function escapeForDrive(value = "") {
  * Llamar a Vertex AI para entender la frase y extraer keywords
  */
 async function extraerKeywordsConLLM(userQuery) {
+  // Si por algún motivo Vertex AI no se inicializó, devolvemos un fallback
+  if (!generativeModel) {
+    console.warn("Vertex AI no inicializado, usando fallback de keywords.");
+    const fallbackKeywords = userQuery
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length > 3);
+    return {
+      search_phrase: userQuery,
+      keywords: fallbackKeywords,
+    };
+  }
+
   const prompt = `
 Eres un asistente que ayuda a buscar documentos en una biblioteca académica en Google Drive.
 
@@ -40,7 +64,7 @@ Usuario dice:
 "${userQuery}"
 
 Tu tarea:
-1. Entender qué tipo de documento está buscando (por ejemplo: libro, guía, apunte, paper, diapositivas, etc.).
+1. Entender qué documento está buscando (por ejemplo: libro, guía, apunte, paper, diapositivas, etc.).
 2. Extraer entre 2 y 5 palabras clave importantes (keywords) relacionadas con el tema o título.
 3. Proponer una frase corta de búsqueda (search_phrase) para usarla como texto principal.
 
@@ -72,7 +96,7 @@ Responde ÚNICAMENTE en JSON con esta forma exacta:
     console.error("No pude parsear JSON del LLM, texto recibido:", text);
   }
 
-  // Fallback básico si el modelo no devuelve JSON válido
+  // Fallback si el modelo devuelve algo raro
   const fallbackKeywords = userQuery
     .toLowerCase()
     .split(/\s+/)
@@ -108,7 +132,6 @@ function buildContentQueryFromKeywords(keywords, fallbackPhrase) {
 const auth = new google.auth.GoogleAuth({
   scopes: ["https://www.googleapis.com/auth/drive.readonly"],
 });
-
 const drive = google.drive({ version: "v3", auth });
 
 /**
@@ -162,8 +185,6 @@ app.post("/", async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: e.message || "Error interno en el buscador",
-      // SOLO para depuración, luego lo puedes borrar:
-      details: e.stack || String(e),
     });
   }
 });

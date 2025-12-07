@@ -10,15 +10,9 @@ app.use(express.json());
  */
 const DEFAULT_PAGE_SIZE = 20;
 
-/**
- * Usa el id de tu proyecto, o toma el de las credenciales
- */
+// Usa el id de tu proyecto (o lo toma de las credenciales)
 const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || "commanding-time-480517-k5";
 const LOCATION = "us-central1";
-
-/** 
- * MUY IMPORTANTE: este id es el que viste en Model Garden (versión 002)
- */
 const MODEL_ID = "gemini-1.5-flash-002";
 
 /**
@@ -28,7 +22,7 @@ let generativeModel;
 try {
   const vertexAI = new VertexAI({ project: PROJECT_ID, location: LOCATION });
   generativeModel = vertexAI.getGenerativeModel({ model: MODEL_ID });
-  console.log("Cliente de Vertex AI inicializado con modelo:", MODEL_ID);
+  console.log("Vertex AI listo con modelo:", MODEL_ID);
 } catch (err) {
   console.error("Error inicializando Vertex AI:", err);
 }
@@ -44,9 +38,8 @@ function escapeForDrive(value = "") {
  * Llamar a Vertex AI para entender la frase y extraer keywords
  */
 async function extraerKeywordsConLLM(userQuery) {
-  // Si por algún motivo Vertex AI no se inicializó, devolvemos un fallback
   if (!generativeModel) {
-    console.warn("Vertex AI no inicializado, usando fallback de keywords.");
+    console.warn("Vertex AI no inicializado, usando fallback.");
     const fallbackKeywords = userQuery
       .toLowerCase()
       .split(/\s+/)
@@ -64,8 +57,8 @@ Usuario dice:
 "${userQuery}"
 
 Tu tarea:
-1. Entender qué documento está buscando (por ejemplo: libro, guía, apunte, paper, diapositivas, etc.).
-2. Extraer entre 2 y 5 palabras clave importantes (keywords) relacionadas con el tema o título.
+1. Entender qué documento está buscando (libro, guía, apunte, paper, diapositivas, etc.).
+2. Extraer entre 2 y 5 palabras clave importantes (keywords).
 3. Proponer una frase corta de búsqueda (search_phrase) para usarla como texto principal.
 
 Responde ÚNICAMENTE en JSON con esta forma exacta:
@@ -96,7 +89,6 @@ Responde ÚNICAMENTE en JSON con esta forma exacta:
     console.error("No pude parsear JSON del LLM, texto recibido:", text);
   }
 
-  // Fallback si el modelo devuelve algo raro
   const fallbackKeywords = userQuery
     .toLowerCase()
     .split(/\s+/)
@@ -127,7 +119,7 @@ function buildContentQueryFromKeywords(keywords, fallbackPhrase) {
 }
 
 /**
- * Cliente de Drive (reutilizable)
+ * Cliente de Drive
  */
 const auth = new google.auth.GoogleAuth({
   scopes: ["https://www.googleapis.com/auth/drive.readonly"],
@@ -155,14 +147,11 @@ app.post("/", async (req, res) => {
       });
     }
 
-    // 1) Pedimos a Vertex AI que entienda la frase y nos dé keywords
     const llmResult = await extraerKeywordsConLLM(query);
     const { search_phrase, keywords } = llmResult;
 
-    // 2) Construimos la query de Drive usando esas keywords
     const driveQuery = buildContentQueryFromKeywords(keywords, search_phrase);
 
-    // 3) Consultamos Google Drive
     const response = await drive.files.list({
       q: driveQuery,
       fields: "files(id, name, mimeType, webViewLink, modifiedTime)",

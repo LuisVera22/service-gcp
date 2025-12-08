@@ -39,7 +39,7 @@ try {
 }
 
 /**
- * Si el modelo falla, hacemos fallback
+ * Fallback simple si Vertex falla
  */
 function fallbackKeywords(text) {
   return text
@@ -49,7 +49,8 @@ function fallbackKeywords(text) {
 }
 
 /**
- * Extraer keywords usando Vertex AI
+ * Extraer intención con Vertex
+ * Vertex ya filtra stopwords, deduce intención y genera términos válidos.
  */
 async function extraerKeywordsConLLM(userQuery) {
   const fallback = {
@@ -58,21 +59,26 @@ async function extraerKeywordsConLLM(userQuery) {
   };
 
   if (!generativeModel) {
-    console.warn("VertexAI no inicializado → usando Fallback");
+    console.warn("Vertex no inicializado → usando fallback");
     return fallback;
   }
 
   const prompt = `
-Eres un asistente que ayuda a buscar documentos académicos en Google Drive.
+Tu función es interpretar consultas de búsqueda de documentos académicos almacenados en Google Drive.
 
-Usuario:
+DADA la consulta del usuario:
+
 "${userQuery}"
 
-Extrae:
-- Una frase corta para buscar (search_phrase)
-- Entre 2 y 6 palabras clave importantes (keywords)
+Debes:
+1. Interpretar la intención real.
+2. Extraer SOLO los términos relevantes (sin stopwords en español o inglés).
+3. Generar:
+   - "search_phrase": una frase corta útil para búsqueda.
+   - "keywords": una lista (2–6 items) de palabras clave significativas, sin relleno,
+     sin stopwords, y con variaciones útiles si aplica (ej: algoritmia, algoritmos).
 
-Responde SOLO en JSON:
+Regresa SOLO un JSON válido:
 {
   "search_phrase": "...",
   "keywords": ["...", "..."]
@@ -87,18 +93,18 @@ Responde SOLO en JSON:
     const part = result?.response?.candidates?.[0]?.content?.parts?.[0];
     const raw = (part?.text || "").trim();
 
-    let parsed = null;
-
+    let parsed;
     try {
       parsed = JSON.parse(raw);
-    } catch (e) {
-      console.warn("JSON inválido del LLM → Fallback:", raw);
+    } catch {
+      console.warn("JSON inválido de Vertex → fallback");
       return fallback;
     }
 
     if (
       parsed &&
-      parsed.search_phrase &&
+      typeof parsed.search_phrase === "string" &&
+      parsed.search_phrase.length > 0 &&
       Array.isArray(parsed.keywords) &&
       parsed.keywords.length > 0
     ) {
@@ -107,27 +113,44 @@ Responde SOLO en JSON:
 
     return fallback;
   } catch (err) {
-    console.error("Error en Vertex AI:", err.message);
+    console.error("Error VertexAI:", err.message);
     return fallback;
   }
 }
 
 /**
- * Construir Query de Drive
+ * Construcción de query para Drive
+ * Vertex decide las keywords, nosotros solo usamos OR.
  */
-function buildDriveQueryFromKeywords(keywords) {
-  const filters = ["trashed = false"];
+function buildDriveQuery(llmResult) {
+  let keywords = [];
 
-  if (keywords.length > 0) {
-    const parts = keywords.map((k) => `fullText contains '${k}'`);
-    filters.push("(" + parts.join(" and ") + ")");
+  if (Array.isArray(llmResult.keywords)) {
+    keywords = llmResult.keywords;
   }
 
-  return filters.join(" and ");
+  if (llmResult.search_phrase) {
+    keywords.unshift(llmResult.search_phrase);
+  }
+
+  const clean = keywords
+    .map((k) => (k || "").trim())
+    .filter((k) => k.length > 0);
+
+  if (clean.length === 0) return "trashed = false";
+
+  const selected = clean.slice(0, 4);
+
+  const parts = selected.map((k) => {
+    const safe = k.replace(/'/g, "\\'");
+    return `fullText contains '${safe}'`;
+  });
+
+  return `trashed = false and (${parts.join(" or ")})`;
 }
 
 /**
- * Handler principal
+ * Endpoint principal
  */
 app.post("/", async (req, res) => {
   try {
@@ -140,26 +163,20 @@ app.post("/", async (req, res) => {
       });
     }
 
-    console.log("Query recibida:", query);
-
-    // Paso 1: Interpretar lenguaje natural con LLM
+    // 1. Interpretación con Vertex AI
     const llm = await extraerKeywordsConLLM(query);
 
-    console.log("Interpretación LLM:", llm);
+    // 2. Drive query usando Vertex AI
+    const driveQuery = buildDriveQuery(llm);
 
-    // Paso 2: Construir query para Drive
-    const driveQuery = buildDriveQueryFromKeywords(llm.keywords);
-
-    console.log("Drive query:", driveQuery);
-
-    // Paso 3: Buscar en Google Drive
+    // 3. Búsqueda en Google Drive
     const response = await drive.files.list({
       q: driveQuery,
       fields: "files(id, name, mimeType, webViewLink, modifiedTime)",
       pageSize: DEFAULT_PAGE_SIZE,
     });
 
-    return res.json({
+    res.json({
       ok: true,
       total: response.data.files.length,
       archivos: response.data.files,
@@ -169,9 +186,9 @@ app.post("/", async (req, res) => {
         drive_query: driveQuery,
       },
     });
-  } catch (e) {
-    console.error("Error general:", e);
-    return res.status(500).json({
+  } catch (err) {
+    console.error("Error general:", err);
+    res.status(500).json({
       ok: false,
       error: "Error interno en el buscador",
     });

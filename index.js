@@ -8,9 +8,16 @@ app.use(express.json());
 /**
  * Configuración
  */
-const DEFAULT_PAGE_SIZE = 20;
-const MAX_DOCS_FOR_LLM = 5;
-const MAX_CHARS_PER_DOC = 4000;
+const DEFAULT_PAGE_SIZE = 20;      // cuántos documentos candidato traemos de Drive
+const MAX_DOCS_FOR_LLM = 10;       // máx. documentos que mandamos a Vertex para ranking
+const MAX_CHARS_PER_DOC = 4000;    // recorte de texto por documento para el contexto
+const LIBRARY_FOLDER_ID = process.env.LIBRARY_FOLDER_ID; // ID carpeta BibliotecaDAMII
+
+if (!LIBRARY_FOLDER_ID) {
+  console.warn(
+    "No se ha definido LIBRARY_FOLDER_ID. Configura process.env.LIBRARY_FOLDER_ID con el ID de tu carpeta de biblioteca."
+  );
+}
 
 /**
  * Cliente de Drive
@@ -41,18 +48,18 @@ try {
 }
 
 /**
- * Fallback simple si Vertex falla (solo se usa si hay problemas con la IA)
+ * Fallback simple si Vertex falla (solo para entender la consulta)
  */
 function fallbackKeywords(text) {
-  return text
+  return (text || "")
     .toLowerCase()
     .split(/\s+/)
     .filter((w) => w.length > 4);
 }
 
 /**
- * Extraer intención con Vertex
- * (idéntico a tu lógica original, solo encapsulado)
+ * Extraer intención con Vertex (solo para metadata de understanding)
+ * Esto NO se usa para filtrar en Drive, solo para mostrar en la respuesta.
  */
 async function extraerKeywordsConLLM(userQuery) {
   const fallback = {
@@ -61,14 +68,14 @@ async function extraerKeywordsConLLM(userQuery) {
   };
 
   if (!generativeModel) {
-    console.warn("Vertex no inicializado → usando fallback");
+    console.warn("Vertex no inicializado → usando fallback para llm");
     return fallback;
   }
 
   const prompt = `
 Tu función es interpretar consultas de búsqueda de documentos académicos almacenados en Google Drive.
 
-DADA la consulta del usuario:
+DADA la consulta del usuario (puede tener errores ortográficos):
 
 "${userQuery}"
 
@@ -78,7 +85,7 @@ Debes:
 3. Generar:
    - "search_phrase": una frase corta útil para búsqueda.
    - "keywords": una lista (2–6 items) de palabras clave significativas, sin relleno,
-     sin stopwords, y con variaciones útiles si aplica (ej: algoritmia, algoritmos).
+     sin stopwords, y corrigiendo errores ortográficos si es necesario.
 
 Regresa SOLO un JSON válido:
 {
@@ -121,42 +128,32 @@ Regresa SOLO un JSON válido:
 }
 
 /**
- * Construcción de query para Drive
- * (igual que lo tenías, usando OR sobre los términos)
+ * Obtener candidatos desde Drive
+ * NO filtramos por fullText, solo por carpeta + no borrado.
+ * Eso permite que la IA haga búsqueda por contexto aunque la query tenga errores.
  */
-function buildDriveQuery(llmResult) {
-  let keywords = [];
+async function obtenerCandidatosDesdeDrive() {
+  const qParts = ["trashed = false"];
 
-  if (Array.isArray(llmResult.keywords)) {
-    keywords = llmResult.keywords;
+  if (LIBRARY_FOLDER_ID) {
+    qParts.push(`'${LIBRARY_FOLDER_ID}' in parents`);
   }
 
-  if (llmResult.search_phrase) {
-    keywords.unshift(llmResult.search_phrase);
-  }
+  const q = qParts.join(" and ");
 
-  const clean = keywords
-    .map((k) => (k || "").trim())
-    .filter((k) => k.length > 0);
-
-  if (clean.length === 0) return "trashed = false";
-
-  const selected = clean.slice(0, 4);
-
-  const parts = selected.map((k) => {
-    const safe = k.replace(/'/g, "\\'");
-    return `fullText contains '${safe}'`;
+  const response = await drive.files.list({
+    q,
+    fields: "files(id, name, mimeType, webViewLink, modifiedTime)",
+    pageSize: DEFAULT_PAGE_SIZE,
+    orderBy: "modifiedTime desc", // trae primero lo más reciente
   });
 
-  // Si quieres limitar a una carpeta, podrías hacer:
-  // return `'CARPETA_ID' in parents and trashed = false and (${parts.join(" or ")})`;
-  return `trashed = false and (${parts.join(" or ")})`;
+  return response.data.files || [];
 }
 
 /**
  * Obtener texto de un archivo de Drive (para que la IA entienda el contenido)
- * Por ahora, soportamos Google Docs → text/plain.
- * Para otros tipos (PDF, Word subido, etc.) puedes ir ampliando luego.
+ * Por ahora soportamos Google Docs. El resto se puede ampliar después.
  */
 async function getFileText(file) {
   const { id, mimeType } = file;
@@ -177,7 +174,8 @@ async function getFileText(file) {
     return buffer.toString("utf8");
   }
 
-  // Otros tipos: de momento no los procesamos (sin texto)
+  // Otros tipos (PDF, Word subido, etc.) por ahora no se procesan como texto
+  // pero igual se devuelven como resultados para que el usuario los vea.
   return "";
 }
 
@@ -185,6 +183,7 @@ async function getFileText(file) {
  * Ordenar los resultados por contexto con IA
  * - SIEMPRE devuelve los mismos archivos que entran (no elimina ninguno)
  * - Solo cambia el orden si la IA responde bien
+ * - Soporta consultas conversacionales y con errores ortográficos.
  */
 async function ordenarPorContexto(userQuery, files) {
   // Si no hay IA o no hay archivos, devolvemos tal cual
@@ -212,7 +211,7 @@ async function ordenarPorContexto(userQuery, files) {
 
   const docsWithText = texts.filter((t) => t.text && t.text.length > 0);
 
-  // Si no hay texto usable, no reordenamos
+  // Si no hay texto usable (por ejemplo, todo eran PDFs sin soporte), no reordenamos.
   if (docsWithText.length === 0) {
     return files;
   }
@@ -234,6 +233,9 @@ ${d.text}
   const prompt = `
 Eres un asistente que ayuda a un estudiante a buscar y entender documentos académicos.
 
+La consulta del usuario puede tener errores ortográficos o ser muy conversacional.
+Tu objetivo es entender el CONTEXTO, no hacer coincidencias exactas de palabras.
+
 Consulta del usuario:
 "${userQuery}"
 
@@ -242,8 +244,9 @@ Tienes los siguientes documentos (fragmentos):
 ${docsBlock}
 
 Tarea:
-Analiza qué tan relevante es cada documento para la consulta.
-Devuelve EXCLUSIVAMENTE un JSON con la forma:
+1. Analiza qué tan relevante es cada documento para la consulta, usando el significado del texto
+   (no te bases solo en palabras exactas).
+2. Devuelve EXCLUSIVAMENTE un JSON con la forma:
 
 {
   "ranking": [
@@ -301,12 +304,12 @@ IMPORTANTE:
 
 /**
  * Endpoint principal
- * → Formato de respuesta como lo tenías antes:
+ * Formato de respuesta:
  * {
  *   ok,
  *   total,
- *   archivos: [files de Drive],
- *   understanding: { original, llm, drive_query }
+ *   archivos: [items reales de Drive],
+ *   understanding: { original, llm }
  * }
  */
 app.post("/", async (req, res) => {
@@ -320,25 +323,16 @@ app.post("/", async (req, res) => {
       });
     }
 
-    // 1. Interpretación con Vertex AI (intención + keywords)
+    // 1. Interpretación con Vertex AI (solo para metadata / debugging)
     const llm = await extraerKeywordsConLLM(query);
 
-    // 2. Construimos la query de Drive
-    const driveQuery = buildDriveQuery(llm);
+    // 2. Obtenemos candidatos desde Drive
+    const files = await obtenerCandidatosDesdeDrive();
 
-    // 3. Buscamos en Drive (documentos del repositorio)
-    const response = await drive.files.list({
-      q: driveQuery,
-      fields: "files(id, name, mimeType, webViewLink, modifiedTime)",
-      pageSize: DEFAULT_PAGE_SIZE,
-    });
-
-    const files = response.data.files || [];
-
-    // 4. Ordenamos por contexto con IA (sin cambiar la estructura de cada item)
+    // 3. Ordenamos por contexto con IA (búsqueda contextual)
     const archivosOrdenados = await ordenarPorContexto(query, files);
 
-    // 5. Respondemos EXACTAMENTE con el formato antiguo
+    // 4. Respuesta en el formato original
     res.json({
       ok: true,
       total: archivosOrdenados.length,
@@ -346,7 +340,9 @@ app.post("/", async (req, res) => {
       understanding: {
         original: query,
         llm,
-        drive_query: driveQuery,
+        drive_query: LIBRARY_FOLDER_ID
+          ? `'${LIBRARY_FOLDER_ID}' in parents and trashed = false`
+          : "trashed = false",
       },
     });
   } catch (err) {

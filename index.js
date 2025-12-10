@@ -8,9 +8,9 @@ app.use(express.json());
 /**
  * Configuración
  */
-const DEFAULT_PAGE_SIZE = 10; // reducimos un poco para no saturar a Vertex
-const MAX_DOCS_FOR_LLM = 5;   // máx. documentos que mandaremos a Vertex
-const MAX_CHARS_PER_DOC = 4000; // recortamos texto por doc
+const DEFAULT_PAGE_SIZE = 20;
+const MAX_DOCS_FOR_LLM = 5;
+const MAX_CHARS_PER_DOC = 4000;
 
 /**
  * Cliente de Drive
@@ -41,7 +41,7 @@ try {
 }
 
 /**
- * Fallback simple si Vertex falla (para keywords)
+ * Fallback simple si Vertex falla (solo se usa si hay problemas con la IA)
  */
 function fallbackKeywords(text) {
   return text
@@ -51,7 +51,8 @@ function fallbackKeywords(text) {
 }
 
 /**
- * Extraer intención con Vertex (igual que ya tienes)
+ * Extraer intención con Vertex
+ * (idéntico a tu lógica original, solo encapsulado)
  */
 async function extraerKeywordsConLLM(userQuery) {
   const fallback = {
@@ -121,6 +122,7 @@ Regresa SOLO un JSON válido:
 
 /**
  * Construcción de query para Drive
+ * (igual que lo tenías, usando OR sobre los términos)
  */
 function buildDriveQuery(llmResult) {
   let keywords = [];
@@ -146,55 +148,51 @@ function buildDriveQuery(llmResult) {
     return `fullText contains '${safe}'`;
   });
 
-  // aquí podrías además filtrar por carpeta "BibliotecaDAMII" si quieres:
-  //   "'<FOLDER_ID>' in parents and trashed = false and (...)"
+  // Si quieres limitar a una carpeta, podrías hacer:
+  // return `'CARPETA_ID' in parents and trashed = false and (${parts.join(" or ")})`;
   return `trashed = false and (${parts.join(" or ")})`;
 }
 
 /**
- * Obtener texto de un archivo de Drive
- * (soporte principal para Google Docs; otros tipos los puedes ir agregando)
+ * Obtener texto de un archivo de Drive (para que la IA entienda el contenido)
+ * Por ahora, soportamos Google Docs → text/plain.
+ * Para otros tipos (PDF, Word subido, etc.) puedes ir ampliando luego.
  */
 async function getFileText(file) {
   const { id, mimeType } = file;
 
-  // Google Docs → exportar como texto plano
+  // Google Docs
   if (mimeType === "application/vnd.google-apps.document") {
     const resp = await drive.files.export(
       {
         fileId: id,
         mimeType: "text/plain",
       },
-      { responseType: "text" }
+      {
+        responseType: "arraybuffer",
+      }
     );
-    return String(resp.data || "");
+
+    const buffer = Buffer.from(resp.data);
+    return buffer.toString("utf8");
   }
 
-  // (Opcional) otros tipos como Sheets, Slides, etc.
-  // if (mimeType === "application/vnd.google-apps.presentation") { ... }
-
-  // Para otros tipos (PDF, Word subido, etc.) puedes:
-  // - Usar una librería para parsear PDF/Word
-  // - O de momento devolver vacío para que no entren al rerank semántico
+  // Otros tipos: de momento no los procesamos (sin texto)
   return "";
 }
 
 /**
- * Re-rankear documentos y generar respuesta con Vertex (búsqueda por contexto)
+ * Ordenar los resultados por contexto con IA
+ * - SIEMPRE devuelve los mismos archivos que entran (no elimina ninguno)
+ * - Solo cambia el orden si la IA responde bien
  */
-async function rerankAndAnswerWithLLM(userQuery, files) {
+async function ordenarPorContexto(userQuery, files) {
+  // Si no hay IA o no hay archivos, devolvemos tal cual
   if (!generativeModel || files.length === 0) {
-    return {
-      answer: null,
-      ranking: files.map((f, i) => ({
-        fileId: f.id,
-        score: 1 - i * 0.1,
-        reason: "Ranking por defecto (sin Vertex)",
-      })),
-    };
+    return files;
   }
 
-  // 1. Obtener texto de algunos documentos (limitamos para no reventar el contexto)
+  // Tomamos algunos documentos para no saturar el contexto
   const topFiles = files.slice(0, MAX_DOCS_FOR_LLM);
 
   const texts = await Promise.all(
@@ -214,19 +212,11 @@ async function rerankAndAnswerWithLLM(userQuery, files) {
 
   const docsWithText = texts.filter((t) => t.text && t.text.length > 0);
 
+  // Si no hay texto usable, no reordenamos
   if (docsWithText.length === 0) {
-    console.warn("Ningún documento tiene texto utilizable → sin rerank semántico");
-    return {
-      answer: null,
-      ranking: files.map((f, i) => ({
-        fileId: f.id,
-        score: 1 - i * 0.1,
-        reason: "Sin texto; ranking por defecto",
-      })),
-    };
+    return files;
   }
 
-  // 2. Construir prompt para Vertex
   const docsBlock = docsWithText
     .map(
       (d, idx) => `
@@ -251,27 +241,22 @@ Tienes los siguientes documentos (fragmentos):
 
 ${docsBlock}
 
-Tareas:
-
-1. Analiza la relevancia de cada documento respecto a la consulta.
-2. Si puedes responder a la consulta usando SOLO el contenido de los documentos, responde de forma clara y breve.
-3. Devuelve EXCLUSIVAMENTE un JSON con la forma:
+Tarea:
+Analiza qué tan relevante es cada documento para la consulta.
+Devuelve EXCLUSIVAMENTE un JSON con la forma:
 
 {
-  "answer": "respuesta en lenguaje natural (o null si no se puede responder con los documentos)",
   "ranking": [
     {
-      "fileId": "id del documento",
-      "score": número entre 0 y 1 (1 = muy relevante),
-      "reason": "breve explicación de por qué es relevante"
+      "fileId": "id del documento (uno de los anteriores)",
+      "score": número entre 0 y 1 (1 = muy relevante)
     }
   ]
 }
 
 IMPORTANTE:
-- No inventes documentos.
-- Si no puedes responder, pon "answer": null.
-- La lista "ranking" debe contener TODOS los documentos que recibiste.
+- NO inventes documentos ni IDs.
+- "fileId" SIEMPRE debe coincidir con uno de los documentos que te di.
 - El JSON debe ser válido.
 `;
 
@@ -287,71 +272,42 @@ IMPORTANTE:
     try {
       parsed = JSON.parse(raw);
     } catch (e) {
-      console.warn("JSON inválido de Vertex (rerank):", e.message);
-      return {
-        answer: null,
-        ranking: files.map((f, i) => ({
-          fileId: f.id,
-          score: 1 - i * 0.1,
-          reason: "JSON inválido de Vertex; ranking por defecto",
-        })),
-      };
+      console.warn("JSON inválido de Vertex (ranking):", e.message);
+      return files; // si falla, devolvemos tal cual
     }
 
-    if (!parsed || !Array.isArray(parsed.ranking)) {
-      return {
-        answer: parsed?.answer ?? null,
-        ranking: files.map((f, i) => ({
-          fileId: f.id,
-          score: 1 - i * 0.1,
-          reason: "Respuesta sin ranking válido; ranking por defecto",
-        })),
-      };
-    }
-
-    // 3. Mapear ranking a los objetos de archivo originales
     const rankingMap = new Map();
-    parsed.ranking.forEach((r) => {
-      if (r.fileId) rankingMap.set(r.fileId, r);
+    if (Array.isArray(parsed.ranking)) {
+      parsed.ranking.forEach((r) => {
+        if (r.fileId) {
+          rankingMap.set(r.fileId, r.score || 0);
+        }
+      });
+    }
+
+    // Copia de files, ordenada por el score (si no está en el ranking, score 0)
+    const ordered = [...files].sort((a, b) => {
+      const sa = rankingMap.get(a.id) ?? 0;
+      const sb = rankingMap.get(b.id) ?? 0;
+      return sb - sa;
     });
 
-    const orderedFiles = [...files].sort((a, b) => {
-      const ra = rankingMap.get(a.id);
-      const rb = rankingMap.get(b.id);
-      return (rb?.score || 0) - (ra?.score || 0);
-    });
-
-    const rankingWithFiles = orderedFiles.map((f) => {
-      const r = rankingMap.get(f.id);
-      return {
-        fileId: f.id,
-        name: f.name,
-        mimeType: f.mimeType,
-        webViewLink: f.webViewLink,
-        score: r?.score ?? 0,
-        reason: r?.reason ?? "Sin explicación",
-      };
-    });
-
-    return {
-      answer: parsed.answer ?? null,
-      ranking: rankingWithFiles,
-    };
+    return ordered;
   } catch (err) {
-    console.error("Error VertexAI (rerank):", err.message);
-    return {
-      answer: null,
-      ranking: files.map((f, i) => ({
-        fileId: f.id,
-        score: 1 - i * 0.1,
-        reason: "Error en Vertex; ranking por defecto",
-      })),
-    };
+    console.error("Error VertexAI (ordenarPorContexto):", err.message);
+    return files; // si algo falla, dejamos el orden que venía de Drive
   }
 }
 
 /**
  * Endpoint principal
+ * → Formato de respuesta como lo tenías antes:
+ * {
+ *   ok,
+ *   total,
+ *   archivos: [files de Drive],
+ *   understanding: { original, llm, drive_query }
+ * }
  */
 app.post("/", async (req, res) => {
   try {
@@ -364,13 +320,13 @@ app.post("/", async (req, res) => {
       });
     }
 
-    // 1. Interpretación con Vertex AI (keywords / intención)
+    // 1. Interpretación con Vertex AI (intención + keywords)
     const llm = await extraerKeywordsConLLM(query);
 
-    // 2. Drive query usando Vertex AI
+    // 2. Construimos la query de Drive
     const driveQuery = buildDriveQuery(llm);
 
-    // 3. Búsqueda en Google Drive (documentos candidatos)
+    // 3. Buscamos en Drive (documentos del repositorio)
     const response = await drive.files.list({
       q: driveQuery,
       fields: "files(id, name, mimeType, webViewLink, modifiedTime)",
@@ -379,14 +335,14 @@ app.post("/", async (req, res) => {
 
     const files = response.data.files || [];
 
-    // 4. Re-rank + respuesta contextual con Vertex AI
-    const { answer, ranking } = await rerankAndAnswerWithLLM(query, files);
+    // 4. Ordenamos por contexto con IA (sin cambiar la estructura de cada item)
+    const archivosOrdenados = await ordenarPorContexto(query, files);
 
+    // 5. Respondemos EXACTAMENTE con el formato antiguo
     res.json({
       ok: true,
-      total: files.length,
-      answer, // respuesta generada por IA (puede ser null)
-      archivos: ranking, // documentos ordenados por relevancia
+      total: archivosOrdenados.length,
+      archivos: archivosOrdenados,
       understanding: {
         original: query,
         llm,

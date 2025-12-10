@@ -8,15 +8,15 @@ app.use(express.json());
 /**
  * Configuración
  */
-const DEFAULT_PAGE_SIZE = 20;      // cuántos documentos candidato traemos de Drive
-const MAX_DOCS_FOR_LLM = 10;       // máx. documentos que mandamos a Vertex para ranking
-const MAX_CHARS_PER_DOC = 4000;    // recorte de texto por documento para el contexto
-const LIBRARY_FOLDER_ID = process.env.LIBRARY_FOLDER_ID; // ID carpeta BibliotecaDAMII
+const DEFAULT_CANDIDATE_PAGE_SIZE = 30;   // cuántos candidatos traemos de Drive
+const MAX_DOCS_FOR_LLM = 12;              // máx. documentos que mandamos a Vertex para ranking
+const MAX_CHARS_PER_DOC = 4000;           // recorte de texto por documento para el contexto
+const SEMANTIC_SCORE_THRESHOLD = 0.4;     // umbral mínimo para considerar relevante
 
-if (!LIBRARY_FOLDER_ID) {
-  console.warn(
-    "No se ha definido LIBRARY_FOLDER_ID. Configura process.env.LIBRARY_FOLDER_ID con el ID de tu carpeta de biblioteca."
-  );
+// Carpeta raíz del repositorio (ej: BibliotecaDAMII)
+const ROOT_FOLDER_ID = process.env.ROOT_FOLDER_ID || null;
+if (!ROOT_FOLDER_ID) {
+  console.warn("⚠️ No se ha definido ROOT_FOLDER_ID. Configura process.env.ROOT_FOLDER_ID con el ID de tu carpeta de biblioteca.");
 }
 
 /**
@@ -58,10 +58,10 @@ function fallbackKeywords(text) {
 }
 
 /**
- * Extraer intención con Vertex (solo para metadata de understanding)
- * Esto NO se usa para filtrar en Drive, solo para mostrar en la respuesta.
+ * 1) Comprensión de la consulta con Vertex
+ *    se usa sólo para metadata (understanding) y debugging
  */
-async function extraerKeywordsConLLM(userQuery) {
+async function entenderConsultaConLLM(userQuery) {
   const fallback = {
     search_phrase: userQuery,
     keywords: fallbackKeywords(userQuery),
@@ -75,17 +75,18 @@ async function extraerKeywordsConLLM(userQuery) {
   const prompt = `
 Tu función es interpretar consultas de búsqueda de documentos académicos almacenados en Google Drive.
 
-DADA la consulta del usuario (puede tener errores ortográficos):
+La consulta puede tener errores ortográficos o estar escrita de forma conversacional.
 
+Consulta del usuario:
 "${userQuery}"
 
 Debes:
 1. Interpretar la intención real.
 2. Extraer SOLO los términos relevantes (sin stopwords en español o inglés).
-3. Generar:
+3. Corregir mentalmente errores ortográficos.
+4. Generar:
    - "search_phrase": una frase corta útil para búsqueda.
-   - "keywords": una lista (2–6 items) de palabras clave significativas, sin relleno,
-     sin stopwords, y corrigiendo errores ortográficos si es necesario.
+   - "keywords": una lista (2–6 items) de palabras clave significativas, sin relleno.
 
 Regresa SOLO un JSON válido:
 {
@@ -122,38 +123,50 @@ Regresa SOLO un JSON válido:
 
     return fallback;
   } catch (err) {
-    console.error("Error VertexAI (keywords):", err.message);
+    console.error("Error VertexAI (entenderConsulta):", err.message);
     return fallback;
   }
 }
 
 /**
- * Obtener candidatos desde Drive
- * NO filtramos por fullText, solo por carpeta + no borrado.
- * Eso permite que la IA haga búsqueda por contexto aunque la query tenga errores.
+ * 2) Construir la query de candidatos para Drive
+ *    Aquí NO usamos contenido, sólo carpeta raíz y exclusión de carpetas.
+ *    Vertex se encargará luego de decidir relevancia por contexto.
  */
-async function obtenerCandidatosDesdeDrive() {
-  const qParts = ["trashed = false"];
+function buildCandidateDriveQuery() {
+  let base = "trashed = false and mimeType != 'application/vnd.google-apps.folder'";
 
-  if (LIBRARY_FOLDER_ID) {
-    qParts.push(`'${LIBRARY_FOLDER_ID}' in parents`);
+  if (ROOT_FOLDER_ID) {
+    // Documentos cuyo parent directo es ROOT_FOLDER_ID
+    base = `'${ROOT_FOLDER_ID}' in parents and ${base}`;
   }
 
-  const q = qParts.join(" and ");
+  return base;
+}
+
+/**
+ * 3) Listar candidatos desde Drive
+ *    Usa la query de arriba, trae N documentos para que Vertex los lea.
+ */
+async function listarCandidatosDesdeDrive() {
+  const q = buildCandidateDriveQuery();
 
   const response = await drive.files.list({
     q,
     fields: "files(id, name, mimeType, webViewLink, modifiedTime)",
-    pageSize: DEFAULT_PAGE_SIZE,
-    orderBy: "modifiedTime desc", // trae primero lo más reciente
+    pageSize: DEFAULT_CANDIDATE_PAGE_SIZE,
+    orderBy: "modifiedTime desc",
   });
 
-  return response.data.files || [];
+  return {
+    driveQuery: q,
+    files: response.data.files || [],
+  };
 }
 
 /**
- * Obtener texto de un archivo de Drive (para que la IA entienda el contenido)
- * Por ahora soportamos Google Docs. El resto se puede ampliar después.
+ * 4) Obtener texto de un archivo de Drive
+ *    Por ahora, sólo Google Docs; el resto sigue siendo candidato, pero sin texto.
  */
 async function getFileText(file) {
   const { id, mimeType } = file;
@@ -174,24 +187,24 @@ async function getFileText(file) {
     return buffer.toString("utf8");
   }
 
-  // Otros tipos (PDF, Word subido, etc.) por ahora no se procesan como texto
-  // pero igual se devuelven como resultados para que el usuario los vea.
+  // Otros tipos (PDF, Word subido, etc.) por ahora no se procesan como texto.
+  // Siguen existiendo como resultados, pero Vertex no puede leer su contenido.
   return "";
 }
 
 /**
- * Ordenar los resultados por contexto con IA
- * - SIEMPRE devuelve los mismos archivos que entran (no elimina ninguno)
- * - Solo cambia el orden si la IA responde bien
- * - Soporta consultas conversacionales y con errores ortográficos.
+ * 5) Ranking semántico con Vertex (búsqueda por contexto)
+ *    - Recibe la query original y los archivos candidatos.
+ *    - Vertex lee fragmentos de los documentos y asigna scores de relevancia.
+ *    - Devolvemos SOLO los archivos con score >= SEMANTIC_SCORE_THRESHOLD.
  */
-async function ordenarPorContexto(userQuery, files) {
-  // Si no hay IA o no hay archivos, devolvemos tal cual
+async function rankearPorContexto(userQuery, files) {
+  // Si no hay IA o no hay archivos, devolvemos tal cual.
   if (!generativeModel || files.length === 0) {
     return files;
   }
 
-  // Tomamos algunos documentos para no saturar el contexto
+  // Tomamos algunos documentos para no saturar el contexto de Vertex.
   const topFiles = files.slice(0, MAX_DOCS_FOR_LLM);
 
   const texts = await Promise.all(
@@ -211,7 +224,7 @@ async function ordenarPorContexto(userQuery, files) {
 
   const docsWithText = texts.filter((t) => t.text && t.text.length > 0);
 
-  // Si no hay texto usable (por ejemplo, todo eran PDFs sin soporte), no reordenamos.
+  // Si no hay texto utilizable, devolvemos el listado original.
   if (docsWithText.length === 0) {
     return files;
   }
@@ -231,28 +244,28 @@ ${d.text}
     .join("\n\n");
 
   const prompt = `
-Eres un asistente que ayuda a un estudiante a buscar y entender documentos académicos.
+Eres un asistente que ayuda a un estudiante a encontrar documentos relevantes en una biblioteca académica.
 
 La consulta del usuario puede tener errores ortográficos o ser muy conversacional.
-Tu objetivo es entender el CONTEXTO, no hacer coincidencias exactas de palabras.
+Tu objetivo es entender el CONTEXTO y el TEMA, no hacer coincidencias exactas de palabras.
 
 Consulta del usuario:
 "${userQuery}"
 
-Tienes los siguientes documentos (fragmentos):
+Tienes los siguientes documentos (fragmentos de contenido):
 
 ${docsBlock}
 
 Tarea:
-1. Analiza qué tan relevante es cada documento para la consulta, usando el significado del texto
-   (no te bases solo en palabras exactas).
-2. Devuelve EXCLUSIVAMENTE un JSON con la forma:
+1. Analiza qué tan relevante es cada documento para la consulta.
+2. Asigna un score entre 0 y 1 (1 = muy relevante, 0 = nada relevante).
+3. Devuelve EXCLUSIVAMENTE un JSON con la forma:
 
 {
   "ranking": [
     {
       "fileId": "id del documento (uno de los anteriores)",
-      "score": número entre 0 y 1 (1 = muy relevante)
+      "score": número entre 0 y 1
     }
   ]
 }
@@ -276,41 +289,53 @@ IMPORTANTE:
       parsed = JSON.parse(raw);
     } catch (e) {
       console.warn("JSON inválido de Vertex (ranking):", e.message);
-      return files; // si falla, devolvemos tal cual
+      // Si falla el ranking, devolvemos todos los archivos tal cual.
+      return files;
     }
 
     const rankingMap = new Map();
     if (Array.isArray(parsed.ranking)) {
       parsed.ranking.forEach((r) => {
         if (r.fileId) {
-          rankingMap.set(r.fileId, r.score || 0);
+          // Clampeamos score al rango [0,1]
+          let s = Number(r.score);
+          if (Number.isNaN(s)) s = 0;
+          if (s < 0) s = 0;
+          if (s > 1) s = 1;
+          rankingMap.set(r.fileId, s);
         }
       });
     }
 
-    // Copia de files, ordenada por el score (si no está en el ranking, score 0)
-    const ordered = [...files].sort((a, b) => {
+    // Ordenamos TODOS los candidatos según el score (aunque no tengan texto, score 0)
+    const sorted = [...files].sort((a, b) => {
       const sa = rankingMap.get(a.id) ?? 0;
       const sb = rankingMap.get(b.id) ?? 0;
       return sb - sa;
     });
 
-    return ordered;
+    // Filtramos por score mínimo (semánticamente relevantes)
+    const filtered = sorted.filter((f) => {
+      const s = rankingMap.get(f.id) ?? 0;
+      return s >= SEMANTIC_SCORE_THRESHOLD;
+    });
+
+    // Si ningún archivo pasa el threshold, devolvemos arreglo vacío.
+    if (filtered.length === 0) {
+      console.warn("Ningún documento superó el umbral semántico.");
+      return [];
+    }
+
+    return filtered;
   } catch (err) {
-    console.error("Error VertexAI (ordenarPorContexto):", err.message);
-    return files; // si algo falla, dejamos el orden que venía de Drive
+    console.error("Error VertexAI (rankearPorContexto):", err.message);
+    return files; // si algo falla, dejamos el orden original
   }
 }
 
 /**
- * Endpoint principal
- * Formato de respuesta:
- * {
- *   ok,
- *   total,
- *   archivos: [items reales de Drive],
- *   understanding: { original, llm }
- * }
+ * 6) Endpoint principal
+ * Formato de respuesta: ok, total, archivos, understanding
  */
 app.post("/", async (req, res) => {
   try {
@@ -323,30 +348,28 @@ app.post("/", async (req, res) => {
       });
     }
 
-    // 1. Interpretación con Vertex AI (solo para metadata / debugging)
-    const llm = await extraerKeywordsConLLM(query);
+    // 1. Vertex entiende la consulta (intención, términos útiles)
+    const llm = await entenderConsultaConLLM(query);
 
-    // 2. Obtenemos candidatos desde Drive
-    const files = await obtenerCandidatosDesdeDrive();
+    // 2. Listamos candidatos desde Drive (repositorio)
+    const { driveQuery, files: candidates } = await listarCandidatosDesdeDrive();
 
-    // 3. Ordenamos por contexto con IA (búsqueda contextual)
-    const archivosOrdenados = await ordenarPorContexto(query, files);
+    // 3. Vertex busca por contexto dentro de esos candidatos
+    const archivosRelevantes = await rankearPorContexto(query, candidates);
 
-    // 4. Respuesta en el formato original
+    // 4. Respuesta en el MISMO formato que antes
     res.json({
       ok: true,
-      total: archivosOrdenados.length,
-      archivos: archivosOrdenados,
+      total: archivosRelevantes.length,
+      archivos: archivosRelevantes,
       understanding: {
         original: query,
         llm,
-        drive_query: LIBRARY_FOLDER_ID
-          ? `'${LIBRARY_FOLDER_ID}' in parents and trashed = false`
-          : "trashed = false",
+        drive_query: driveQuery,
       },
     });
   } catch (err) {
-    console.error("Error general:", err);
+    console.error("Error general en buscador:", err);
     res.status(500).json({
       ok: false,
       error: "Error interno en el buscador",

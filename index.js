@@ -289,8 +289,8 @@ IMPORTANTE:
       parsed = JSON.parse(raw);
     } catch (e) {
       console.warn("JSON inválido de Vertex (ranking):", e.message);
-      // Si falla el ranking, devolvemos todos los archivos tal cual.
-      return files;
+      // Si falla el ranking, devolvemos un arreglo vacíos.
+      return [];
     }
 
     const rankingMap = new Map();

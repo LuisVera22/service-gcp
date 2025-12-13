@@ -6,28 +6,12 @@ const app = express();
 app.use(express.json());
 
 /**
- * =========================
- * CONFIG FIJA (SIN ENV)
- * =========================
+ * Configuración
  */
-const PROJECT_ID = "commanding-time-480517-k5";
-const LOCATION = "us-central1";
-
-// ID FIJO DE TU CARPETA
-const ROOT_FOLDER_ID = "1qMM6F1WvuZZywW3h66TP-bPhsb63J9Zm";
-
-// Modelos
-const EMBEDDING_MODEL = "text-embedding-004";
-
-// Search params
-const MIN_SIMILARITY = 0.65;
-const TOP_K = 5;
-const MAX_CHARS = 8000;
+const DEFAULT_PAGE_SIZE = 20;
 
 /**
- * =========================
- * Drive client
- * =========================
+ * Cliente de Drive
  */
 const auth = new google.auth.GoogleAuth({
   scopes: ["https://www.googleapis.com/auth/drive.readonly"],
@@ -35,144 +19,186 @@ const auth = new google.auth.GoogleAuth({
 const drive = google.drive({ version: "v3", auth });
 
 /**
- * =========================
- * Vertex embeddings
- * =========================
+ * Inicializar Vertex AI
  */
-const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
-const embeddingModel = vertex.getGenerativeModel({ model: EMBEDDING_MODEL });
+let generativeModel = null;
 
-async function embed(text) {
-  const res = await embeddingModel.generateContent({
-    contents: [{ role: "user", parts: [{ text }] }],
+try {
+  const vertexAI = new VertexAI({
+    project: process.env.GOOGLE_CLOUD_PROJECT,
+    location: "us-central1",
   });
 
-  const emb =
-    res?.response?.candidates?.[0]?.content?.parts?.[0]?.embedding?.values;
+  generativeModel = vertexAI.getGenerativeModel({
+    model: "google/model-garden/gemini-1.5-flash-002",
+  });
 
-  if (!emb) throw new Error("No embedding");
-  return emb;
+  console.log("VertexAI inicializado correctamente");
+} catch (err) {
+  console.error("NO SE PUDO INICIALIZAR VERTEX AI:", err.message);
 }
 
 /**
- * =========================
- * Utils
- * =========================
+ * Fallback simple si Vertex falla
  */
-function cosine(a, b) {
-  let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
+function fallbackKeywords(text) {
+  return text
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length > 4);
+}
+
+/**
+ * Extraer intención con Vertex
+ * Vertex ya filtra stopwords, deduce intención y genera términos válidos.
+ */
+async function extraerKeywordsConLLM(userQuery) {
+  const fallback = {
+    search_phrase: userQuery,
+    keywords: fallbackKeywords(userQuery),
+  };
+
+  if (!generativeModel) {
+    console.warn("Vertex no inicializado → usando fallback");
+    return fallback;
   }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb));
-}
 
-/**
- * =========================
- * Extraer texto (Docs, Word, PDF)
- * =========================
- */
-async function extractText(file) {
+  const prompt = `
+Tu función es interpretar consultas de búsqueda de documentos académicos almacenados en Google Drive.
+
+DADA la consulta del usuario:
+
+"${userQuery}"
+
+Debes:
+1. Interpretar la intención real.
+2. Extraer SOLO los términos relevantes (sin stopwords en español o inglés).
+3. Generar:
+   - "search_phrase": una frase corta útil para búsqueda.
+   - "keywords": una lista (2–6 items) de palabras clave significativas, sin relleno,
+     sin stopwords, y con variaciones útiles si aplica (ej: algoritmia, algoritmos).
+
+Regresa SOLO un JSON válido:
+{
+  "search_phrase": "...",
+  "keywords": ["...", "..."]
+}
+`;
+
   try {
-    // Google Docs
-    if (file.mimeType === "application/vnd.google-apps.document") {
-      const res = await drive.files.export(
-        { fileId: file.id, mimeType: "text/plain" },
-        { responseType: "arraybuffer" }
-      );
-      return Buffer.from(res.data).toString("utf8");
+    const result = await generativeModel.generateContent({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+    });
+
+    const part = result?.response?.candidates?.[0]?.content?.parts?.[0];
+    const raw = (part?.text || "").trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      console.warn("JSON inválido de Vertex → fallback");
+      return fallback;
     }
 
-    // Word o PDF (export a texto)
     if (
-      file.mimeType === "application/pdf" ||
-      file.mimeType ===
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      parsed &&
+      typeof parsed.search_phrase === "string" &&
+      parsed.search_phrase.length > 0 &&
+      Array.isArray(parsed.keywords) &&
+      parsed.keywords.length > 0
     ) {
-      const res = await drive.files.export(
-        { fileId: file.id, mimeType: "text/plain" },
-        { responseType: "arraybuffer" }
-      );
-      return Buffer.from(res.data).toString("utf8");
+      return parsed;
     }
-  } catch (e) {
-    console.warn(`No se pudo leer ${file.name}`);
-  }
 
-  return "";
+    return fallback;
+  } catch (err) {
+    console.error("Error VertexAI:", err.message);
+    return fallback;
+  }
 }
 
 /**
- * =========================
- * MAIN ENDPOINT (Workflow)
- * =========================
+ * Construcción de query para Drive
+ * Vertex decide las keywords, nosotros solo usamos OR.
+ */
+function buildDriveQuery(llmResult) {
+  let keywords = [];
+
+  if (Array.isArray(llmResult.keywords)) {
+    keywords = llmResult.keywords;
+  }
+
+  if (llmResult.search_phrase) {
+    keywords.unshift(llmResult.search_phrase);
+  }
+
+  const clean = keywords
+    .map((k) => (k || "").trim())
+    .filter((k) => k.length > 0);
+
+  if (clean.length === 0) return "trashed = false";
+
+  const selected = clean.slice(0, 4);
+
+  const parts = selected.map((k) => {
+    const safe = k.replace(/'/g, "\\'");
+    return `fullText contains '${safe}'`;
+  });
+
+  return `trashed = false and (${parts.join(" or ")})`;
+}
+
+/**
+ * Endpoint principal
  */
 app.post("/", async (req, res) => {
   try {
     const { query } = req.body || {};
-    if (!query) {
-      return res.status(400).json({ ok: false, error: "Falta query" });
-    }
 
-    // 1) Listar archivos
-    const list = await drive.files.list({
-      q: `'${ROOT_FOLDER_ID}' in parents and trashed=false`,
-      fields: "files(id,name,mimeType,webViewLink)",
-    });
-
-    const files = list.data.files || [];
-
-    if (files.length === 0) {
-      return res.json({
-        ok: true,
-        total: 0,
-        archivos: [],
-        understanding: { original: query },
+    if (!query || typeof query !== "string") {
+      return res.status(400).json({
+        ok: false,
+        error: "El campo 'query' es obligatorio y debe ser texto",
       });
     }
 
-    // 2) Embedding del query
-    const queryVec = await embed(query);
+    // 1. Interpretación con Vertex AI
+    const llm = await extraerKeywordsConLLM(query);
 
-    const scored = [];
+    // 2. Drive query usando Vertex AI
+    const driveQuery = buildDriveQuery(llm);
 
-    // 3) Procesar cada archivo
-    for (const f of files) {
-      const text = (await extractText(f)).slice(0, MAX_CHARS);
-      if (!text) continue;
-
-      const docVec = await embed(text);
-      const score = cosine(queryVec, docVec);
-
-      if (score >= MIN_SIMILARITY) {
-        scored.push({
-          id: f.id,
-          name: f.name,
-          webViewLink: f.webViewLink,
-          score: Number(score.toFixed(4)),
-        });
-      }
-    }
-
-    scored.sort((a, b) => b.score - a.score);
+    // 3. Búsqueda en Google Drive
+    const response = await drive.files.list({
+      q: driveQuery,
+      fields: "files(id, name, mimeType, webViewLink, modifiedTime)",
+      pageSize: DEFAULT_PAGE_SIZE,
+    });
 
     res.json({
       ok: true,
-      total: scored.length,
-      archivos: scored.slice(0, TOP_K),
+      total: response.data.files.length,
+      archivos: response.data.files,
       understanding: {
         original: query,
-        drive_query: `'${ROOT_FOLDER_ID}'`,
+        llm,
+        drive_query: driveQuery,
       },
     });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: "Error interno" });
+  } catch (err) {
+    console.error("Error general:", err);
+    res.status(500).json({
+      ok: false,
+      error: "Error interno en el buscador",
+    });
   }
 });
 
-app.listen(8080, () =>
-  console.log("Servicio SIMPLE de búsqueda activo en puerto 8080")
-);
+/**
+ * Iniciar servidor
+ */
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`Servicio buscarendrive activo en puerto ${PORT}`);
+});

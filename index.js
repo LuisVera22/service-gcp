@@ -7,21 +7,22 @@ app.use(express.json());
 
 /**
  * =========================
- * CONFIG
+ * CONFIG FIJA (SIN ENV)
  * =========================
  */
-const PORT = process.env.PORT || 8080;
-const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT;
-const LOCATION = process.env.VERTEX_LOCATION || "us-central1";
-const ROOT_FOLDER_ID = process.env.ROOT_FOLDER_ID;
+const PROJECT_ID = "commanding-time-480517-k5";
+const LOCATION = "us-central1";
 
+// ID FIJO DE TU CARPETA
+const ROOT_FOLDER_ID = "1qMM6F1WvuZZywW3h66TP-bPhsb63J9Zm";
+
+// Modelos
 const EMBEDDING_MODEL = "text-embedding-004";
-const MIN_SIMILARITY = 0.72;
-const TOP_K = 10;
 
-if (!ROOT_FOLDER_ID) {
-  console.warn("⚠️ ROOT_FOLDER_ID no definido");
-}
+// Search params
+const MIN_SIMILARITY = 0.65;
+const TOP_K = 5;
+const MAX_CHARS = 8000;
 
 /**
  * =========================
@@ -35,7 +36,7 @@ const drive = google.drive({ version: "v3", auth });
 
 /**
  * =========================
- * Vertex Embeddings
+ * Vertex embeddings
  * =========================
  */
 const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
@@ -55,11 +56,9 @@ async function embed(text) {
 
 /**
  * =========================
- * Index (en memoria)
+ * Utils
  * =========================
  */
-let INDEX = [];
-
 function cosine(a, b) {
   let dot = 0, na = 0, nb = 0;
   for (let i = 0; i < a.length; i++) {
@@ -72,57 +71,44 @@ function cosine(a, b) {
 
 /**
  * =========================
- * Indexar Drive
+ * Extraer texto (Docs, Word, PDF)
  * =========================
  */
-async function indexDrive() {
-  INDEX = [];
+async function extractText(file) {
+  try {
+    // Google Docs
+    if (file.mimeType === "application/vnd.google-apps.document") {
+      const res = await drive.files.export(
+        { fileId: file.id, mimeType: "text/plain" },
+        { responseType: "arraybuffer" }
+      );
+      return Buffer.from(res.data).toString("utf8");
+    }
 
-  const res = await drive.files.list({
-    q: `'${ROOT_FOLDER_ID}' in parents and trashed=false`,
-    fields: "files(id,name,mimeType,webViewLink)",
-  });
-
-  for (const f of res.data.files || []) {
-    if (f.mimeType !== "application/vnd.google-apps.document") continue;
-
-    const txt = await drive.files.export(
-      { fileId: f.id, mimeType: "text/plain" },
-      { responseType: "arraybuffer" }
-    );
-
-    const text = Buffer.from(txt.data).toString("utf8").slice(0, 8000);
-    const vector = await embed(text);
-
-    INDEX.push({
-      id: f.id,
-      name: f.name,
-      webViewLink: f.webViewLink,
-      vector,
-    });
+    // Word o PDF (export a texto)
+    if (
+      file.mimeType === "application/pdf" ||
+      file.mimeType ===
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ) {
+      const res = await drive.files.export(
+        { fileId: file.id, mimeType: "text/plain" },
+        { responseType: "arraybuffer" }
+      );
+      return Buffer.from(res.data).toString("utf8");
+    }
+  } catch (e) {
+    console.warn(`No se pudo leer ${file.name}`);
   }
 
-  return INDEX.length;
+  return "";
 }
 
 /**
  * =========================
- * Endpoints
+ * MAIN ENDPOINT (Workflow)
  * =========================
  */
-
-// Indexar
-app.post("/reindex", async (_req, res) => {
-  try {
-    const count = await indexDrive();
-    res.json({ ok: true, indexed: count });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Buscar (lo llama tu workflow)
 app.post("/", async (req, res) => {
   try {
     const { query } = req.body || {};
@@ -130,32 +116,52 @@ app.post("/", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Falta query" });
     }
 
-    if (INDEX.length === 0) {
+    // 1) Listar archivos
+    const list = await drive.files.list({
+      q: `'${ROOT_FOLDER_ID}' in parents and trashed=false`,
+      fields: "files(id,name,mimeType,webViewLink)",
+    });
+
+    const files = list.data.files || [];
+
+    if (files.length === 0) {
       return res.json({
         ok: true,
         total: 0,
         archivos: [],
-        understanding: {
-          original: query,
-          drive_query: `'${ROOT_FOLDER_ID}' (needs /reindex)`,
-        },
+        understanding: { original: query },
       });
     }
 
-    const qVec = await embed(query);
+    // 2) Embedding del query
+    const queryVec = await embed(query);
 
-    const scored = INDEX.map((d) => ({
-      ...d,
-      score: cosine(qVec, d.vector),
-    }))
-      .filter((d) => d.score >= MIN_SIMILARITY)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, TOP_K);
+    const scored = [];
+
+    // 3) Procesar cada archivo
+    for (const f of files) {
+      const text = (await extractText(f)).slice(0, MAX_CHARS);
+      if (!text) continue;
+
+      const docVec = await embed(text);
+      const score = cosine(queryVec, docVec);
+
+      if (score >= MIN_SIMILARITY) {
+        scored.push({
+          id: f.id,
+          name: f.name,
+          webViewLink: f.webViewLink,
+          score: Number(score.toFixed(4)),
+        });
+      }
+    }
+
+    scored.sort((a, b) => b.score - a.score);
 
     res.json({
       ok: true,
       total: scored.length,
-      archivos: scored.map(({ vector, ...f }) => f),
+      archivos: scored.slice(0, TOP_K),
       understanding: {
         original: query,
         drive_query: `'${ROOT_FOLDER_ID}'`,
@@ -167,6 +173,6 @@ app.post("/", async (req, res) => {
   }
 });
 
-app.listen(PORT, () =>
-  console.log(`Servicio simple activo en puerto ${PORT}`)
+app.listen(8080, () =>
+  console.log("Servicio SIMPLE de búsqueda activo en puerto 8080")
 );

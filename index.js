@@ -1,3 +1,5 @@
+"use strict";
+
 const express = require("express");
 const { google } = require("googleapis");
 const { VertexAI } = require("@google-cloud/vertexai");
@@ -6,21 +8,50 @@ const app = express();
 app.use(express.json());
 
 /**
- * Configuración
+ * 
+ * CONFIG
+ * 
  */
-const DEFAULT_CANDIDATE_PAGE_SIZE = 30;   // cuántos candidatos traemos de Drive
-const MAX_DOCS_FOR_LLM = 12;              // máx. documentos que mandamos a Vertex para ranking
-const MAX_CHARS_PER_DOC = 4000;           // recorte de texto por documento para el contexto
-const SEMANTIC_SCORE_THRESHOLD = 0.4;     // umbral mínimo para considerar relevante
+const PORT = process.env.PORT || 8080;
 
-// Carpeta raíz del repositorio (ej: BibliotecaDAMII)
+// Carpeta raíz obligatoria (BibliotecaDAMII)
 const ROOT_FOLDER_ID = process.env.ROOT_FOLDER_ID || null;
+
+// Vertex
+const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT;
+const LOCATION = process.env.VERTEX_LOCATION || "us-central1";
+
+// Modelos
+// Gemini para intención y reescritura (salida JSON)
+const GEMINI_MODEL =
+  process.env.GEMINI_MODEL || "google/model-garden/gemini-1.5-flash-002";
+
+// Embeddings para búsqueda semántica real
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "text-embedding-004";
+
+// Indexación (chunks)
+const CHUNK_SIZE = 1100; // chars
+const CHUNK_OVERLAP = 150; // chars
+const MAX_TEXT_CHARS_PER_FILE = 140_000; // recorte por doc
+
+// Recuperación
+const TOPK_CHUNKS = 36; // chunks candidatos
+const TOPK_DOCS = 12; // docs finales
+
+// Umbral default (si Gemini no sugiere uno)
+const DEFAULT_MIN_SIMILARITY = 0.72;
+
+// Seguridad básica: si no hay folder id, no buscamos
 if (!ROOT_FOLDER_ID) {
-  console.warn("⚠️ No se ha definido ROOT_FOLDER_ID. Configura process.env.ROOT_FOLDER_ID con el ID de tu carpeta de biblioteca.");
+  console.warn(
+    "⚠️ ROOT_FOLDER_ID no definido. El buscador responderá 0 resultados por seguridad."
+  );
 }
 
 /**
- * Cliente de Drive
+ * 
+ * GOOGLE DRIVE CLIENT
+ * 
  */
 const auth = new google.auth.GoogleAuth({
   scopes: ["https://www.googleapis.com/auth/drive.readonly"],
@@ -28,314 +59,427 @@ const auth = new google.auth.GoogleAuth({
 const drive = google.drive({ version: "v3", auth });
 
 /**
- * Inicializar Vertex AI
+ * 
+ * VERTEX INIT
+ * 
  */
-let generativeModel = null;
+let geminiModel = null;
+let embeddingModel = null;
 
 try {
-  const vertexAI = new VertexAI({
-    project: process.env.GOOGLE_CLOUD_PROJECT,
-    location: "us-central1",
-  });
+  if (!PROJECT_ID) {
+    console.warn("GOOGLE_CLOUD_PROJECT no definido. Vertex no iniciará.");
+  } else {
+    const vertexAI = new VertexAI({ project: PROJECT_ID, location: LOCATION });
 
-  generativeModel = vertexAI.getGenerativeModel({
-    model: "google/model-garden/gemini-1.5-flash-002",
-  });
+    geminiModel = vertexAI.getGenerativeModel({ model: GEMINI_MODEL });
+    embeddingModel = vertexAI.getGenerativeModel({ model: EMBEDDING_MODEL });
 
-  console.log("VertexAI inicializado correctamente");
-} catch (err) {
-  console.error("NO SE PUDO INICIALIZAR VERTEX AI:", err.message);
-}
-
-/**
- * Fallback simple si Vertex falla (solo para entender la consulta)
- */
-function fallbackKeywords(text) {
-  return (text || "")
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((w) => w.length > 4);
-}
-
-/**
- * 1) Comprensión de la consulta con Vertex
- *    se usa sólo para metadata (understanding) y debugging
- */
-async function entenderConsultaConLLM(userQuery) {
-  const fallback = {
-    search_phrase: userQuery,
-    keywords: fallbackKeywords(userQuery),
-  };
-
-  if (!generativeModel) {
-    console.warn("Vertex no inicializado → usando fallback para llm");
-    return fallback;
-  }
-
-  const prompt = `
-Tu función es interpretar consultas de búsqueda de documentos académicos almacenados en Google Drive.
-
-La consulta puede tener errores ortográficos o estar escrita de forma conversacional.
-
-Consulta del usuario:
-"${userQuery}"
-
-Debes:
-1. Interpretar la intención real.
-2. Extraer SOLO los términos relevantes (sin stopwords en español o inglés).
-3. Corregir mentalmente errores ortográficos.
-4. Generar:
-   - "search_phrase": una frase corta útil para búsqueda.
-   - "keywords": una lista (2–6 items) de palabras clave significativas, sin relleno.
-
-Regresa SOLO un JSON válido:
-{
-  "search_phrase": "...",
-  "keywords": ["...", "..."]
-}
-`;
-
-  try {
-    const result = await generativeModel.generateContent({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
+    console.log("Vertex inicializado:", {
+      project: PROJECT_ID,
+      location: LOCATION,
+      gemini: GEMINI_MODEL,
+      embedding: EMBEDDING_MODEL,
     });
-
-    const part = result?.response?.candidates?.[0]?.content?.parts?.[0];
-    const raw = (part?.text || "").trim();
-
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      console.warn("JSON inválido de Vertex → fallback");
-      return fallback;
-    }
-
-    if (
-      parsed &&
-      typeof parsed.search_phrase === "string" &&
-      parsed.search_phrase.length > 0 &&
-      Array.isArray(parsed.keywords) &&
-      parsed.keywords.length > 0
-    ) {
-      return parsed;
-    }
-
-    return fallback;
-  } catch (err) {
-    console.error("Error VertexAI (entenderConsulta):", err.message);
-    return fallback;
   }
+} catch (e) {
+  console.error("No se pudo inicializar Vertex:", e.message);
 }
 
 /**
- * 2) Construir la query de candidatos para Drive
- *    Aquí NO usamos contenido, sólo carpeta raíz y exclusión de carpetas.
- *    Vertex se encargará luego de decidir relevancia por contexto.
+ * 
+ * VECTOR STORE (IN-MEMORY)
+ * 
+ * items: { chunkId, fileId, fileName, webViewLink, modifiedTime, text, vector:number[] }
  */
-function buildCandidateDriveQuery() {
-  let base = "trashed = false and mimeType != 'application/vnd.google-apps.folder'";
-
-  if (ROOT_FOLDER_ID) {
-    // Documentos cuyo parent directo es ROOT_FOLDER_ID
-    base = `'${ROOT_FOLDER_ID}' in parents and ${base}`;
+class InMemoryVectorStore {
+  constructor() {
+    this.items = [];
+    this.fileMeta = new Map(); // fileId -> meta
+    this.indexedAt = null;
   }
 
-  return base;
+  clear() {
+    this.items = [];
+    this.fileMeta.clear();
+    this.indexedAt = null;
+  }
+
+  upsertFileMeta(meta) {
+    this.fileMeta.set(meta.id, meta);
+  }
+
+  replaceFileChunks(fileId, chunks) {
+    this.items = this.items.filter((x) => x.fileId !== fileId);
+    this.items.push(...chunks);
+  }
+
+  static cosine(a, b) {
+    let dot = 0,
+      na = 0,
+      nb = 0;
+    const n = Math.min(a.length, b.length);
+    for (let i = 0; i < n; i++) {
+      const x = Number(a[i]) || 0;
+      const y = Number(b[i]) || 0;
+      dot += x * y;
+      na += x * x;
+      nb += y * y;
+    }
+    const denom = Math.sqrt(na) * Math.sqrt(nb);
+    return denom ? dot / denom : 0;
+  }
+
+  search(queryVec, topK) {
+    const scored = this.items.map((it) => ({
+      ...it,
+      similarity: InMemoryVectorStore.cosine(queryVec, it.vector),
+    }));
+    scored.sort((x, y) => y.similarity - x.similarity);
+    return scored.slice(0, topK);
+  }
 }
 
-/**
- * 3) Listar candidatos desde Drive
- *    Usa la query de arriba, trae N documentos para que Vertex los lea.
- */
-async function listarCandidatosDesdeDrive() {
-  const q = buildCandidateDriveQuery();
+const vectorStore = new InMemoryVectorStore();
 
-  const response = await drive.files.list({
+/**
+ * 
+ * HELPERS: DRIVE RECURSIVE LIST
+ * 
+ */
+async function listChildren(folderId, pageToken) {
+  const q = `'${folderId}' in parents and trashed = false`;
+  const resp = await drive.files.list({
     q,
-    fields: "files(id, name, mimeType, webViewLink, modifiedTime)",
-    pageSize: DEFAULT_CANDIDATE_PAGE_SIZE,
-    orderBy: "modifiedTime desc",
+    pageSize: 1000,
+    pageToken,
+    fields: "nextPageToken, files(id,name,mimeType,webViewLink,modifiedTime)",
   });
+  return resp.data;
+}
 
-  return {
-    driveQuery: q,
-    files: response.data.files || [],
-  };
+async function listAllFilesRecursively(rootFolderId) {
+  const out = [];
+  const queue = [rootFolderId];
+
+  while (queue.length) {
+    const folderId = queue.shift();
+    let pageToken = undefined;
+
+    do {
+      const data = await listChildren(folderId, pageToken);
+      pageToken = data.nextPageToken || undefined;
+
+      for (const f of data.files || []) {
+        if (f.mimeType === "application/vnd.google-apps.folder") {
+          queue.push(f.id);
+        } else {
+          out.push(f);
+        }
+      }
+    } while (pageToken);
+  }
+
+  return out;
 }
 
 /**
- * 4) Obtener texto de un archivo de Drive
- *    Por ahora, sólo Google Docs; el resto sigue siendo candidato, pero sin texto.
+ * 
+ * TEXT EXTRACTION
+ * 
+ * Por ahora: Google Docs -> export text/plain
+ * Recomendado: ampliar para PDF/DOCX con Document AI o pipeline propio.
  */
 async function getFileText(file) {
   const { id, mimeType } = file;
 
-  // Google Docs
   if (mimeType === "application/vnd.google-apps.document") {
     const resp = await drive.files.export(
-      {
-        fileId: id,
-        mimeType: "text/plain",
-      },
-      {
-        responseType: "arraybuffer",
-      }
+      { fileId: id, mimeType: "text/plain" },
+      { responseType: "arraybuffer" }
     );
-
-    const buffer = Buffer.from(resp.data);
-    return buffer.toString("utf8");
+    return Buffer.from(resp.data).toString("utf8");
   }
 
-  // Otros tipos (PDF, Word subido, etc.) por ahora no se procesan como texto.
-  // Siguen existiendo como resultados, pero Vertex no puede leer su contenido.
   return "";
 }
 
 /**
- * 5) Ranking semántico con Vertex (búsqueda por contexto)
- *    - Recibe la query original y los archivos candidatos.
- *    - Vertex lee fragmentos de los documentos y asigna scores de relevancia.
- *    - Devolvemos SOLO los archivos con score >= SEMANTIC_SCORE_THRESHOLD.
+ * 
+ * CHUNKING
+ * 
  */
-async function rankearPorContexto(userQuery, files) {
-  // Si no hay IA o no hay archivos, devolvemos tal cual.
-  if (!generativeModel || files.length === 0) {
-    return files;
+function chunkText(text) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  if (!t) return [];
+
+  const clipped = t.slice(0, MAX_TEXT_CHARS_PER_FILE);
+  const chunks = [];
+
+  let start = 0;
+  while (start < clipped.length) {
+    const end = Math.min(start + CHUNK_SIZE, clipped.length);
+    const piece = clipped.slice(start, end).trim();
+    if (piece) chunks.push(piece);
+
+    if (end >= clipped.length) break;
+    start = Math.max(0, end - CHUNK_OVERLAP);
   }
 
-  // Tomamos algunos documentos para no saturar el contexto de Vertex.
-  const topFiles = files.slice(0, MAX_DOCS_FOR_LLM);
+  return chunks;
+}
 
-  const texts = await Promise.all(
-    topFiles.map(async (f) => {
-      try {
-        const text = await getFileText(f);
-        return {
-          file: f,
-          text: (text || "").slice(0, MAX_CHARS_PER_DOC),
-        };
-      } catch (e) {
-        console.warn(`No se pudo leer el archivo ${f.id}:`, e.message);
-        return { file: f, text: "" };
-      }
-    })
-  );
+/**
+ * 
+ * VERTEX: INTENT + REWRITE (GEMINI)
+ * 
+ * Sin keywords. Gemini decide si tiene sentido buscar.
+ */
+async function analyzeIntentAndRewrite(userQuery) {
+  const fallback = {
+    should_search: true,
+    rewritten_query: (userQuery || "").trim(),
+    topics: [],
+    min_similarity: null,
+    reason: "fallback_no_vertex_or_parse_error",
+  };
 
-  const docsWithText = texts.filter((t) => t.text && t.text.length > 0);
-
-  // Si no hay texto utilizable, devolvemos el listado original.
-  if (docsWithText.length === 0) {
-    return files;
-  }
-
-  const docsBlock = docsWithText
-    .map(
-      (d, idx) => `
-[DOC_${idx + 1}]
-id: ${d.file.id}
-nombre: ${d.file.name}
-contenido:
-"""
-${d.text}
-"""
-`
-    )
-    .join("\n\n");
+  if (!geminiModel) return fallback;
 
   const prompt = `
-Eres un asistente que ayuda a un estudiante a encontrar documentos relevantes en una biblioteca académica.
-
-La consulta del usuario puede tener errores ortográficos o ser muy conversacional.
-Tu objetivo es entender el CONTEXTO y el TEMA, no hacer coincidencias exactas de palabras.
+Eres un clasificador y reescritor de consultas para un buscador de documentos académicos almacenados en Google Drive.
 
 Consulta del usuario:
 "${userQuery}"
 
-Tienes los siguientes documentos (fragmentos de contenido):
+Tareas:
+1) Decide si el usuario realmente quiere BUSCAR documentos (should_search).
+   - Si es saludo, charla, prueba ("hola", "ok", "xd", "gracias", etc.) => should_search = false
+   - Si pide encontrar, buscar, consultar, un tema, libro, documento => should_search = true
 
-${docsBlock}
+2) Si should_search = true:
+   - rewritten_query: reescribe la consulta como una petición clara de búsqueda en español, conservando el contexto.
+   - topics: 1 a 5 temas (strings) si aplica.
+   - min_similarity: sugiere un umbral entre 0.60 y 0.85 (más alto si la consulta es muy genérica).
 
-Tarea:
-1. Analiza qué tan relevante es cada documento para la consulta.
-2. Asigna un score entre 0 y 1 (1 = muy relevante, 0 = nada relevante).
-3. Devuelve EXCLUSIVAMENTE un JSON con la forma:
+3) Si should_search = false:
+   - rewritten_query puede ser "".
+   - min_similarity puede ser null.
 
+Responde SOLO JSON válido EXACTAMENTE con estas llaves:
 {
-  "ranking": [
-    {
-      "fileId": "id del documento (uno de los anteriores)",
-      "score": número entre 0 y 1
-    }
-  ]
+  "should_search": true|false,
+  "rewritten_query": "string",
+  "topics": ["..."],
+  "min_similarity": 0.72,
+  "reason": "string"
 }
-
-IMPORTANTE:
-- NO inventes documentos ni IDs.
-- "fileId" SIEMPRE debe coincidir con uno de los documentos que te di.
-- El JSON debe ser válido.
 `;
 
   try {
-    const result = await generativeModel.generateContent({
+    const result = await geminiModel.generateContent({
+      generationConfig: {
+        responseMimeType: "application/json",
+        temperature: 0.2,
+        maxOutputTokens: 256,
+      },
       contents: [{ role: "user", parts: [{ text: prompt }] }],
     });
 
-    const part = result?.response?.candidates?.[0]?.content?.parts?.[0];
-    const raw = (part?.text || "").trim();
+    const raw =
+      result?.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
 
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (e) {
-      console.warn("JSON inválido de Vertex (ranking):", e.message);
-      // Si falla el ranking, devolvemos un arreglo vacíos.
-      return [];
-    }
+    const parsed = JSON.parse(raw);
 
-    const rankingMap = new Map();
-    if (Array.isArray(parsed.ranking)) {
-      parsed.ranking.forEach((r) => {
-        if (r.fileId) {
-          // Clampeamos score al rango [0,1]
-          let s = Number(r.score);
-          if (Number.isNaN(s)) s = 0;
-          if (s < 0) s = 0;
-          if (s > 1) s = 1;
-          rankingMap.set(r.fileId, s);
-        }
-      });
-    }
+    const ok =
+      parsed &&
+      typeof parsed.should_search === "boolean" &&
+      typeof parsed.reason === "string" &&
+      (parsed.should_search === false ||
+        typeof parsed.rewritten_query === "string");
 
-    // Ordenamos TODOS los candidatos según el score (aunque no tengan texto, score 0)
-    const sorted = [...files].sort((a, b) => {
-      const sa = rankingMap.get(a.id) ?? 0;
-      const sb = rankingMap.get(b.id) ?? 0;
-      return sb - sa;
-    });
+    if (!ok) return fallback;
 
-    // Filtramos por score mínimo (semánticamente relevantes)
-    const filtered = sorted.filter((f) => {
-      const s = rankingMap.get(f.id) ?? 0;
-      return s >= SEMANTIC_SCORE_THRESHOLD;
-    });
-
-    // Si ningún archivo pasa el threshold, devolvemos arreglo vacío.
-    if (filtered.length === 0) {
-      console.warn("Ningún documento superó el umbral semántico.");
-      return [];
-    }
-
-    return filtered;
-  } catch (err) {
-    console.error("Error VertexAI (rankearPorContexto):", err.message);
-    return files; // si algo falla, dejamos el orden original
+    return {
+      should_search: parsed.should_search,
+      rewritten_query: (parsed.rewritten_query || "").trim(),
+      topics: Array.isArray(parsed.topics) ? parsed.topics.slice(0, 5) : [],
+      min_similarity:
+        typeof parsed.min_similarity === "number" ? parsed.min_similarity : null,
+      reason: parsed.reason,
+    };
+  } catch (e) {
+    console.warn("Intent/Rewrite: JSON inválido o error Vertex:", e.message);
+    return fallback;
   }
 }
 
 /**
- * 6) Endpoint principal
- * Formato de respuesta: ok, total, archivos, understanding
+ * 
+ * VERTEX: EMBEDDINGS
+ * 
+ * La forma exacta de extracción del embedding puede variar por versión del SDK.
+ * Esta función intenta varias rutas comunes.
+ */
+async function embedText(text) {
+  if (!embeddingModel) throw new Error("embedding_model_not_initialized");
+
+  const result = await embeddingModel.generateContent({
+    // En algunos SDKs, esto funciona tal cual para modelos de embedding.
+    // Si la versión requiere otro método, ajustamos con algún output real.
+    contents: [{ role: "user", parts: [{ text }] }],
+  });
+
+  const emb =
+    result?.response?.candidates?.[0]?.content?.parts?.[0]?.embedding?.values ||
+    result?.response?.candidates?.[0]?.embedding?.values ||
+    result?.response?.embeddings?.[0]?.values ||
+    result?.response?.embedding?.values;
+
+  if (!emb || !Array.isArray(emb)) {
+    throw new Error("embedding_not_found_in_response");
+  }
+
+  return emb.map((x) => Number(x) || 0);
+}
+
+/**
+ * 
+ * INDEX BUILD
+ * 
+ */
+async function indexFolder(rootFolderId) {
+  if (!rootFolderId) throw new Error("missing_ROOT_FOLDER_ID");
+
+  // Recolectar todos los archivos dentro de la carpeta y subcarpetas
+  const allFiles = await listAllFilesRecursively(rootFolderId);
+
+  let indexedFiles = 0;
+  let skippedNoText = 0;
+  let totalChunks = 0;
+
+  for (const f of allFiles) {
+    vectorStore.upsertFileMeta(f);
+
+    let text = "";
+    try {
+      text = await getFileText(f);
+    } catch (e) {
+      // no texto => skip
+      text = "";
+    }
+
+    const chunks = chunkText(text);
+
+    if (chunks.length === 0) {
+      skippedNoText++;
+      continue;
+    }
+
+    const chunkVectors = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const cText = chunks[i];
+
+      // Si embeddings fallan, ese archivo no se indexa
+      const vec = await embedText(cText);
+
+      chunkVectors.push({
+        chunkId: `${f.id}::${i}`,
+        fileId: f.id,
+        fileName: f.name,
+        webViewLink: f.webViewLink,
+        modifiedTime: f.modifiedTime,
+        text: cText,
+        vector: vec,
+      });
+    }
+
+    vectorStore.replaceFileChunks(f.id, chunkVectors);
+    indexedFiles++;
+    totalChunks += chunkVectors.length;
+  }
+
+  vectorStore.indexedAt = new Date().toISOString();
+
+  return {
+    rootFolderId,
+    totalFiles: allFiles.length,
+    indexedFiles,
+    skippedNoText,
+    totalChunks,
+    indexedAt: vectorStore.indexedAt,
+  };
+}
+
+/**
+ * 
+ * SEMANTIC SEARCH
+ * 
+ */
+async function semanticSearch(userQuery, minSimilarity) {
+  const qVec = await embedText(userQuery);
+  const topChunks = vectorStore.search(qVec, TOPK_CHUNKS);
+
+  // Agregar por documento (usamos score max para ranking)
+  const byDoc = new Map();
+  for (const c of topChunks) {
+    const prev = byDoc.get(c.fileId);
+    if (!prev) {
+      byDoc.set(c.fileId, {
+        id: c.fileId,
+        name: c.fileName,
+        webViewLink: c.webViewLink,
+        modifiedTime: c.modifiedTime,
+        scoreMax: c.similarity,
+        count: 1,
+        scoreSum: c.similarity,
+        bestSnippet: c.text.slice(0, 320),
+      });
+    } else {
+      prev.scoreMax = Math.max(prev.scoreMax, c.similarity);
+      prev.count += 1;
+      prev.scoreSum += c.similarity;
+      if (c.similarity >= prev.scoreMax) {
+        prev.bestSnippet = c.text.slice(0, 320);
+      }
+    }
+  }
+
+  const docs = [...byDoc.values()]
+    .map((d) => ({
+      ...d,
+      score: d.scoreMax,
+      scoreAvg: d.scoreSum / d.count,
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  const filtered = docs.filter((d) => d.score >= minSimilarity).slice(0, TOPK_DOCS);
+
+  // Formato de salida: "archivos" como objetos Drive-like
+  const archivos = filtered.map((d) => ({
+    id: d.id,
+    name: d.name,
+    webViewLink: d.webViewLink,
+    modifiedTime: d.modifiedTime
+  }));
+
+  return {
+    archivos,
+    debug: {
+      used_query: userQuery,
+      min_similarity: minSimilarity,
+      top_chunks_preview: topChunks.slice(0, 6).map((x) => ({
+        fileId: x.fileId,
+        sim: Number(x.similarity.toFixed(4)),
+      })),
+    },
+  };
+}
+
+/**
+ * 
+ * MAIN ENDPOINT
+ * 
  */
 app.post("/", async (req, res) => {
   try {
@@ -348,29 +492,92 @@ app.post("/", async (req, res) => {
       });
     }
 
-    // 1. Vertex entiende la consulta (intención, términos útiles)
-    const llm = await entenderConsultaConLLM(query);
+    // Seguridad: sin carpeta raíz => 0 resultados
+    if (!ROOT_FOLDER_ID) {
+      return res.json({
+        ok: true,
+        total: 0,
+        archivos: [],
+        understanding: {
+          original: query,
+          llm: null,
+          drive_query: null,
+          note: "ROOT_FOLDER_ID no configurado: búsqueda deshabilitada por seguridad.",
+        },
+      });
+    }
 
-    // 2. Listamos candidatos desde Drive (repositorio)
-    const { driveQuery, files: candidates } = await listarCandidatosDesdeDrive();
+    // 1) Vertex (Gemini) decide intención + reescribe
+    const intent = await analyzeIntentAndRewrite(query);
 
-    // 3. Vertex busca por contexto dentro de esos candidatos
-    const archivosRelevantes = await rankearPorContexto(query, candidates);
+    if (!intent.should_search) {
+      return res.json({
+        ok: true,
+        total: 0,
+        archivos: [],
+        understanding: {
+          original: query,
+          llm: intent,
+          drive_query: `'${ROOT_FOLDER_ID}' (indexed recursively)`,
+        },
+      });
+    }
 
-    // 4. Respuesta en el MISMO formato que antes
-    res.json({
+    const rewritten = intent.rewritten_query || query.trim();
+    const minSim =
+      typeof intent.min_similarity === "number"
+        ? Math.min(0.85, Math.max(0.60, intent.min_similarity))
+        : DEFAULT_MIN_SIMILARITY;
+
+    // 2) Si no hay índice cargado, devolvemos 0.
+    if (vectorStore.items.length === 0) {
+      return res.json({
+        ok: true,
+        total: 0,
+        archivos: [],
+        understanding: {
+          original: query,
+          llm: intent,
+          drive_query: `'${ROOT_FOLDER_ID}' (needs /reindex)`,
+          note: "Índice vacío. Ejecuta POST /reindex para indexar documentos.",
+        },
+      });
+    }
+
+    // 3) Búsqueda semántica con embeddings
+    let result;
+    try {
+      result = await semanticSearch(rewritten, minSim);
+    } catch (e) {
+      // Fallo de embeddings/búsqueda => 0 resultados
+      console.error("semanticSearch error:", e.message);
+      return res.json({
+        ok: true,
+        total: 0,
+        archivos: [],
+        understanding: {
+          original: query,
+          llm: intent,
+          drive_query: `'${ROOT_FOLDER_ID}' (indexed recursively)`,
+          error: "semantic_search_failed",
+        },
+      });
+    }
+
+    return res.json({
       ok: true,
-      total: archivosRelevantes.length,
-      archivos: archivosRelevantes,
+      total: result.archivos.length,
+      archivos: result.archivos,
       understanding: {
         original: query,
-        llm,
-        drive_query: driveQuery,
+        llm: intent,
+        drive_query: `'${ROOT_FOLDER_ID}' (indexed recursively)`,
+        debug: result.debug,
       },
     });
   } catch (err) {
     console.error("Error general en buscador:", err);
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
       error: "Error interno en el buscador",
     });
@@ -378,9 +585,32 @@ app.post("/", async (req, res) => {
 });
 
 /**
- * Iniciar servidor
+ * 
+ * INDEX ENDPOINT
  */
-const PORT = process.env.PORT || 8080;
+app.post("/reindex", async (_req, res) => {
+  try {
+    if (!ROOT_FOLDER_ID) {
+      return res.status(400).json({ ok: false, error: "ROOT_FOLDER_ID requerido" });
+    }
+    if (!embeddingModel) {
+      return res.status(400).json({
+        ok: false,
+        error: "Vertex embeddings no está inicializado (revisa GOOGLE_CLOUD_PROJECT / permisos / modelo)",
+      });
+    }
+
+    // Limpia y reindexa
+    vectorStore.clear();
+    const stats = await indexFolder(ROOT_FOLDER_ID);
+
+    return res.json({ ok: true, stats });
+  } catch (e) {
+    console.error("reindex error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Servicio buscarendrive activo en puerto ${PORT}`);
 });
